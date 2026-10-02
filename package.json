@@ -1,6 +1,6 @@
 {
   "name": "remix-hook-form",
-  "version": "7.2.0",
+  "version": "7.2.1",
   "description": "Utility wrapper around react-hook-form for use with react-router v7+",
   "type": "module",
   "main": "./dist/index.cjs",
