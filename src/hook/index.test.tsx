@@ -7,6 +7,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import React from "react";
+import type { Control, UseFormReturn } from "react-hook-form";
 import { type Navigation, useFetcher } from "react-router";
 import { RemixFormProvider, useRemixForm, useRemixFormContext } from "./index";
 
@@ -23,7 +24,9 @@ const useNavigationMock = vi.hoisted(() =>
   })),
 );
 
-const useHrefMock = vi.hoisted(() => vi.fn());
+const useHrefMock = vi.hoisted(() =>
+  vi.fn<(to: string) => string | undefined>(() => "/"),
+);
 
 vi.mock("react-router", () => ({
   useSubmit: () => submitMock,
@@ -450,6 +453,243 @@ describe("useRemixForm", () => {
     booleanFieldProps = result.current.register("boolean");
     expect(booleanFieldProps.defaultChecked).toBe(false);
     expect(booleanFieldProps.defaultValue).toBe(undefined);
+  });
+
+  it("types the return value with every react-hook-form member (#185, #116)", () => {
+    type Values = { name: string };
+    const { result } = renderHook(() => useRemixForm<Values>({}));
+    // Fails to compile when the return type misses a member of UseFormReturn
+    const members: Omit<
+      UseFormReturn<Values>,
+      "handleSubmit" | "reset" | "register"
+    > = result.current;
+    const control: Control<Values> = result.current.control;
+    expect(members.getValues).toBeInstanceOf(Function);
+    expect(control).toBe(result.current.control);
+  });
+
+  it("keeps the leading slash of the action when the basename ends with a slash (#175)", async () => {
+    submitMock.mockReset();
+    useActionDataMock.mockReturnValue(undefined);
+    useHrefMock.mockImplementation(() => "/my-basename/");
+    vi.spyOn(window, "location", "get").mockReturnValueOnce({
+      origin: "http://example.com",
+      // biome-ignore lint/suspicious/noExplicitAny: partial location mock
+    } as any);
+
+    const { result } = renderHook(() =>
+      useRemixForm({
+        resolver: () => ({ values: {}, errors: {} }),
+      }),
+    );
+
+    act(() => {
+      result.current.handleSubmit({
+        currentTarget: {
+          action: "http://example.com/my-basename/basename-test-submit",
+        },
+        // biome-ignore lint/suspicious/noExplicitAny: partial event mock
+      } as any);
+    });
+    await waitFor(() => {
+      expect(submitMock).toHaveBeenCalledWith(expect.any(FormData), {
+        method: "post",
+        action: "/basename-test-submit",
+      });
+    });
+    useHrefMock.mockImplementation(() => "/");
+  });
+
+  it("submits when the form has inputs named action, method or enctype (#139)", async () => {
+    submitMock.mockReset();
+    useActionDataMock.mockReturnValue(undefined);
+    const form = document.createElement("form");
+    // In a browser, an input replaces the form property with the same name
+    for (const name of ["action", "method", "enctype"]) {
+      const input = document.createElement("input");
+      input.name = name;
+      form.appendChild(input);
+      Object.defineProperty(form, name, { value: input });
+    }
+    // The HTMLFormElement getters still return the real values
+    const getters = [
+      vi
+        .spyOn(HTMLFormElement.prototype, "action", "get")
+        .mockReturnValue(`${window.location.origin}/submit`),
+      vi
+        .spyOn(HTMLFormElement.prototype, "method", "get")
+        .mockReturnValue("post"),
+      vi
+        .spyOn(HTMLFormElement.prototype, "enctype", "get")
+        .mockReturnValue("multipart/form-data"),
+    ];
+
+    const { result } = renderHook(() =>
+      useRemixForm({
+        resolver: () => ({ values: {}, errors: {} }),
+      }),
+    );
+
+    act(() => {
+      // biome-ignore lint/suspicious/noExplicitAny: partial event mock
+      result.current.handleSubmit({ currentTarget: form } as any);
+    });
+    await waitFor(() => {
+      expect(submitMock).toHaveBeenCalledWith(expect.any(FormData), {
+        method: "post",
+        action: "/submit",
+        encType: "multipart/form-data",
+      });
+    });
+    for (const getter of getters) getter.mockRestore();
+  });
+
+  it("lets clearErrors remove errors returned by the server (#12)", async () => {
+    const serverData = {
+      errors: {
+        root: { message: "Server error" },
+        name: { message: "Name is taken" },
+      },
+    };
+    useActionDataMock.mockReturnValue(serverData);
+
+    const { result, rerender } = renderHook(() =>
+      useRemixForm<{ name: string }>({ defaultValues: { name: "" } }),
+    );
+    await waitFor(() => {
+      expect(result.current.formState.errors.root?.message).toBe(
+        "Server error",
+      );
+    });
+
+    act(() => {
+      result.current.clearErrors("root");
+      result.current.clearErrors("name");
+    });
+    rerender();
+
+    expect(result.current.formState.errors.root).toBeUndefined();
+    expect(result.current.formState.errors.name).toBeUndefined();
+    useActionDataMock.mockReturnValue(undefined);
+  });
+
+  it("exposes the default submit handler so onValid can wrap it (#148)", async () => {
+    submitMock.mockReset();
+    useActionDataMock.mockReturnValue(undefined);
+
+    const { result } = renderHook(() => {
+      const form = useRemixForm<{ name: string; extra?: string }>({
+        resolver: () => ({ values: { name: "John" }, errors: {} }),
+        submitHandlers: {
+          onValid: (data) => {
+            form.defaultSubmitHandler({ ...data, extra: "from onValid" });
+          },
+        },
+      });
+      return form;
+    });
+
+    act(() => {
+      result.current.handleSubmit({
+        currentTarget: {
+          action: `${window.location.origin}/wrapped`,
+          method: "post",
+        },
+        // biome-ignore lint/suspicious/noExplicitAny: partial event mock
+      } as any);
+    });
+    await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(1));
+
+    const [formData, options] = submitMock.mock.calls[0];
+    expect(formData.get("name")).toBe(JSON.stringify("John"));
+    expect(formData.get("extra")).toBe(JSON.stringify("from onValid"));
+    // The form action and method still apply without passing them through
+    expect(options).toEqual({ method: "post", action: "/wrapped" });
+  });
+
+  it("submits the raw field values when submitRawValues is true (#172)", async () => {
+    submitMock.mockReset();
+    useActionDataMock.mockReturnValue(undefined);
+
+    const { result } = renderHook(() =>
+      // biome-ignore lint/suspicious/noExplicitAny: default context type
+      useRemixForm<{ date: string }, any, { date: Date }>({
+        defaultValues: { date: "2025-01-01" },
+        resolver: (values) => ({
+          values: { date: new Date(values.date) },
+          errors: {},
+        }),
+        submitRawValues: true,
+      }),
+    );
+
+    act(() => {
+      // biome-ignore lint/suspicious/noExplicitAny: partial event mock
+      result.current.handleSubmit({} as any);
+    });
+    await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(1));
+
+    expect(submitMock.mock.calls[0][0].get("date")).toBe(
+      JSON.stringify("2025-01-01"),
+    );
+  });
+
+  describe("resetOnSuccess (#157)", () => {
+    const submitAndFinish = async (actionData: unknown) => {
+      submitMock.mockReset();
+      useActionDataMock.mockReturnValue(undefined);
+      useNavigationMock.mockReturnValue({
+        state: "idle",
+        formData: undefined,
+        json: undefined,
+      });
+
+      const hook = renderHook(() =>
+        useRemixForm<{ name: string }>({
+          defaultValues: { name: "default" },
+          resolver: (values) => ({ values, errors: {} }),
+          resetOnSuccess: true,
+        }),
+      );
+      act(() => hook.result.current.setValue("name", "changed"));
+      act(() => {
+        // biome-ignore lint/suspicious/noExplicitAny: partial event mock
+        hook.result.current.handleSubmit({} as any);
+      });
+      await waitFor(() => expect(submitMock).toHaveBeenCalledTimes(1));
+
+      useNavigationMock.mockReturnValue({
+        state: "submitting",
+        formData: new FormData(),
+        json: undefined,
+      });
+      hook.rerender();
+      expect(hook.result.current.getValues("name")).toBe("changed");
+
+      useActionDataMock.mockReturnValue(actionData);
+      useNavigationMock.mockReturnValue({
+        state: "idle",
+        formData: undefined,
+        json: undefined,
+      });
+      hook.rerender();
+      await act(async () => {});
+      return hook;
+    };
+
+    it("resets the form when the action returns no errors", async () => {
+      const { result } = await submitAndFinish({ ok: true });
+      expect(result.current.getValues("name")).toBe("default");
+      useActionDataMock.mockReturnValue(undefined);
+    });
+
+    it("keeps the values when the action returns errors", async () => {
+      const { result } = await submitAndFinish({
+        errors: { name: { message: "Name is taken" } },
+      });
+      expect(result.current.getValues("name")).toBe("changed");
+      useActionDataMock.mockReturnValue(undefined);
+    });
   });
 });
 
