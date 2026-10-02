@@ -3,6 +3,7 @@ import React, {
   type ReactNode,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import {
@@ -17,6 +18,7 @@ import {
   type SubmitHandler,
   type UseFormHandleSubmit,
   type UseFormProps,
+  type UseFormRegisterReturn,
   type UseFormReturn,
   get,
   useForm,
@@ -54,7 +56,37 @@ export interface UseRemixFormOptions<
    * If true, all values will be stringified before being sent to the server, otherwise everything but strings will be stringified (default: true)
    */
   stringifyAllValues?: boolean;
+  /**
+   * If true, the default submit handler sends the field values as the user entered them (`getValues()`),
+   * not the output of the resolver. Use it when the server runs the same resolver, so transforms
+   * (for example a zod `.transform()`) do not run twice. The data that `defaultSubmitHandler` gets is ignored. (default: false)
+   */
+  submitRawValues?: boolean;
+  /**
+   * If true, the form is reset after a submission when the action returns no `errors`. (default: false)
+   */
+  resetOnSuccess?: boolean;
 }
+
+// An input named "action", "method" or "enctype" replaces the form property with
+// the same name (form.method returns the <input>), so read it with the HTMLFormElement getter
+const getFormProperty = (
+  form: EventTarget | null | undefined,
+  name: "action" | "method" | "enctype",
+): string | undefined => {
+  if (
+    typeof HTMLFormElement !== "undefined" &&
+    form instanceof HTMLFormElement
+  ) {
+    return Object.getOwnPropertyDescriptor(
+      HTMLFormElement.prototype,
+      name,
+    )?.get?.call(form);
+  }
+  // biome-ignore lint/suspicious/noExplicitAny: handleSubmit can get an event that is not from a form
+  return (form as any)?.[name];
+};
+
 export const useRemixForm = <
   TFieldValues extends FieldValues,
   // biome-ignore lint/suspicious/noExplicitAny: defaults to any type
@@ -66,8 +98,14 @@ export const useRemixForm = <
   submitData,
   fetcher,
   stringifyAllValues = true,
+  submitRawValues = false,
+  resetOnSuccess = false,
   ...formProps
-}: UseRemixFormOptions<TFieldValues, TContext, TTransformedValues>) => {
+}: UseRemixFormOptions<
+  TFieldValues,
+  TContext,
+  TTransformedValues
+>): UseRemixFormReturn<TFieldValues, TContext, TTransformedValues> => {
   const [isSubmittedSuccessfully, setIsSubmittedSuccessfully] = useState(false);
   const basename = useHref("/");
   const actionSubmit = useSubmit();
@@ -99,12 +137,14 @@ export const useRemixForm = <
 
   // A state to keep track whether we're actually submitting the form through the network
   const [isSubmittingNetwork, setIsSubmittingNetwork] = useState(false);
-  // When the network submission is done, set the state to `false`
-  useEffect(() => {
-    if (!isSubmittingForm) {
-      setIsSubmittingNetwork(false);
-    }
-  }, [isSubmittingForm]);
+
+  // The form props of the last handleSubmit call, so a custom onValid can call
+  // defaultSubmitHandler(data) without passing them through
+  const submittedFormProps = useRef<{
+    encType?: FormEncType;
+    method?: FormMethod;
+    action?: string;
+  }>({});
 
   // Submits the data to the server when form is valid
   const onSubmit = useMemo(
@@ -112,17 +152,18 @@ export const useRemixForm = <
       (
         data: TTransformedValues,
         // biome-ignore lint/suspicious/noExplicitAny: <explanation>
-        e: any,
-        formEncType?: FormEncType,
-        formMethod?: FormMethod,
-        formAction?: string,
+        e?: any,
+        formEncType = submittedFormProps.current.encType,
+        formMethod = submittedFormProps.current.method,
+        formAction = submittedFormProps.current.action,
       ) => {
         setIsSubmittingNetwork(true);
         setIsSubmittedSuccessfully(true);
         const encType = submitConfig?.encType ?? formEncType;
         const method = submitConfig?.method ?? formMethod ?? "post";
         const action = submitConfig?.action ?? formAction;
-        const submitPayload = { ...data, ...submitData };
+        const values = submitRawValues ? methods.getValues() : data;
+        const submitPayload = { ...values, ...submitData };
         const formData =
           encType === "application/json"
             ? submitPayload
@@ -135,7 +176,14 @@ export const useRemixForm = <
           action,
         });
       },
-    [submit, submitConfig, submitData, stringifyAllValues],
+    [
+      submit,
+      submitConfig,
+      submitData,
+      stringifyAllValues,
+      submitRawValues,
+      methods.getValues,
+    ],
   );
 
   // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -205,6 +253,18 @@ export const useRemixForm = <
     [methods.reset],
   );
 
+  // When the network submission is done, set the state to `false`
+  useEffect(() => {
+    if (isSubmittingForm) {
+      return;
+    }
+    const hasServerErrors = data?.errors && Object.keys(data.errors).length > 0;
+    if (resetOnSuccess && isSubmittingNetwork && !hasServerErrors) {
+      reset();
+    }
+    setIsSubmittingNetwork(false);
+  }, [isSubmittingForm]);
+
   const register = useMemo(
     () =>
       (
@@ -231,14 +291,21 @@ export const useRemixForm = <
 
   const handleSubmit = useMemo(
     () => (e?: FormEvent<HTMLFormElement>) => {
-      const encType = e?.currentTarget?.enctype as FormEncType | undefined;
-      const method = e?.currentTarget?.method as FormMethod | undefined;
-      const action = e?.currentTarget?.action.replace(
-        `${window.location.origin}${basename === "/" ? "" : basename}`,
+      const form = e?.currentTarget;
+      const encType = getFormProperty(form, "enctype") as
+        | FormEncType
+        | undefined;
+      const method = getFormProperty(form, "method") as FormMethod | undefined;
+      // Without the trailing slash of "/app/", the action keeps its leading "/"
+      const action = getFormProperty(form, "action")?.replace(
+        `${window.location.origin}${basename.replace(/\/$/, "")}`,
         "",
       );
+      submittedFormProps.current = { encType, method, action };
 
-      const onValidHandler = submitHandlers?.onValid ?? onSubmit;
+      // A custom onValid also gets the form props, as before
+      const onValidHandler: typeof onSubmit =
+        submitHandlers?.onValid ?? onSubmit;
       const onInvalidHandler = submitHandlers?.onInvalid ?? onInvalid;
 
       return methods.handleSubmit(
@@ -256,21 +323,43 @@ export const useRemixForm = <
       reset,
       register,
       formState,
+      defaultSubmitHandler: onSubmit,
     }),
-    [methods, handleSubmit, reset, register, formState],
+    [methods, handleSubmit, reset, register, formState, onSubmit],
   );
 
   return hookReturn;
 };
+
+// Derived from UseFormReturn, so members that new react-hook-form versions add are typed too
 export type UseRemixFormReturn<
   TFieldValues extends FieldValues = FieldValues,
   // biome-ignore lint/suspicious/noExplicitAny: defaults to any type
   TContext = any,
   TTransformedValues = TFieldValues,
-> = UseFormReturn<TFieldValues, TContext, TTransformedValues> & {
-  handleSubmit: ReturnType<typeof useRemixForm>["handleSubmit"];
-  reset: ReturnType<typeof useRemixForm>["reset"];
-  register: ReturnType<typeof useRemixForm>["register"];
+> = Omit<
+  UseFormReturn<TFieldValues, TContext, TTransformedValues>,
+  "handleSubmit" | "reset" | "register"
+> & {
+  handleSubmit: (e?: FormEvent<HTMLFormElement>) => Promise<void>;
+  reset: (
+    values?: TFieldValues | DefaultValues<TFieldValues>,
+    options?: KeepStateOptions,
+  ) => void;
+  register: (
+    name: Path<TFieldValues>,
+    options?: RegisterOptions<TFieldValues> & {
+      disableProgressiveEnhancement?: boolean;
+    },
+  ) => UseFormRegisterReturn<Path<TFieldValues>> & {
+    defaultValue?: string;
+    defaultChecked?: boolean;
+  };
+  /**
+   * The submit handler that useRemixForm uses when `submitHandlers.onValid` is not set.
+   * Call it in a custom `onValid` to submit the form to the action in the default way.
+   */
+  defaultSubmitHandler: SubmitHandler<TTransformedValues>;
 };
 interface RemixFormProviderProps<
   TFieldValues extends FieldValues = FieldValues,
@@ -305,7 +394,14 @@ export const useRemixFormContext = <
   // biome-ignore lint/suspicious/noExplicitAny: defaults to any type
   TContext = any,
   TTransformedValues = TFieldValues,
->() => {
+>(): Omit<
+  UseFormReturn<TFieldValues, TContext, TTransformedValues>,
+  "handleSubmit"
+> & {
+  handleSubmit: ReturnType<
+    UseFormHandleSubmit<TFieldValues, TTransformedValues>
+  >;
+} => {
   const methods = useFormContext<TFieldValues, TContext, TTransformedValues>();
   return {
     ...methods,
