@@ -13,9 +13,13 @@ const tryParseJSON = (value: string | File | Blob) => {
   }
 };
 
+// Key parts that can reach Object.prototype and pollute every object in the process.
+const UNSAFE_KEY_PARTS = new Set(["__proto__", "constructor", "prototype"]);
+
 /**
  * Generates an output object from the given form data, where the keys in the output object retain
  * the structure of the keys in the form data. Keys containing integer indexes are treated as arrays.
+ * Throws if a key contains "__proto__", "constructor" or "prototype" as a key part.
  */
 export const generateFormData = (
   formData: FormData | URLSearchParams,
@@ -26,7 +30,8 @@ export const generateFormData = (
   const outputObject: Record<any, any> = {};
 
   // See if a key is repeated, and then handle that in a special case
-  const keyCounts: Record<string, number> = {};
+  // No prototype, so keys like "toString" do not read inherited values
+  const keyCounts: Record<string, number> = Object.create(null);
   for (const key of formData.keys()) {
     keyCounts[key] = (keyCounts[key] ?? 0) + 1;
   }
@@ -40,6 +45,11 @@ export const generateFormData = (
     const data = preserveStringified ? value : tryParseJSON(value);
     // Split the key into an array of parts.
     const keyParts = key.split(".");
+    for (const keyPart of keyParts) {
+      if (UNSAFE_KEY_PARTS.has(keyPart.replace(/\[\d*\]$/, ""))) {
+        throw new Error(`Unsafe form data key: ${key}`);
+      }
+    }
     // Initialize a variable to point to the current object in the output object.
     let currentObject = outputObject;
 
@@ -47,9 +57,10 @@ export const generateFormData = (
     for (let i = 0; i < keyParts.length - 1; i++) {
       // Get the current key part.
       const keyPart = keyParts[i];
-      // If the current object doesn't have a property with the current key part,
+      // If the current object doesn't have an own property with the current key part,
       // initialize it as an object or array depending on whether the next key part is a valid integer index or not.
-      if (!currentObject[keyPart]) {
+      // Own only: never walk into inherited values like toString.
+      if (!Object.hasOwn(currentObject, keyPart) || !currentObject[keyPart]) {
         currentObject[keyPart] = /^\d+$/.test(keyParts[i + 1]) ? [] : {};
       }
       // Move the current object pointer to the next level of the output object.
@@ -63,7 +74,7 @@ export const generateFormData = (
     // Handles array[] or array[0] cases
     if (lastKeyPartIsArray) {
       const key = lastKeyPart.replace(/\[\d*\]$|\[\]$/, "");
-      if (!currentObject[key]) {
+      if (!Object.hasOwn(currentObject, key) || !currentObject[key]) {
         currentObject[key] = [];
       }
 
@@ -78,7 +89,7 @@ export const generateFormData = (
       // Otherwise, set a property on the current object with the last key part and the corresponding value.
       else {
         if (keyCount > 1) {
-          if (!currentObject[key]) {
+          if (!Object.hasOwn(currentObject, key) || !currentObject[key]) {
             currentObject[key] = [];
           }
           currentObject[key].push(data);

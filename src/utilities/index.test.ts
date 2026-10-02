@@ -207,6 +207,58 @@ describe("generateFormData", () => {
 
     expect(generateFormData(formData)).toEqual(expectedOutput);
   });
+
+  describe("prototype pollution", () => {
+    afterEach(() => {
+      // biome-ignore lint/suspicious/noExplicitAny: cleanup if a test pollutes
+      delete (Object.prototype as any).polluted;
+      // biome-ignore lint/suspicious/noExplicitAny: cleanup if a test pollutes
+      delete (Object.prototype.toString as any).call;
+    });
+
+    it.each([
+      "__proto__.polluted",
+      "constructor.prototype.polluted",
+      "a.__proto__.polluted",
+      "__proto__",
+      "__proto__[]",
+      "a.constructor",
+      "prototype[0]",
+    ])("throws on unsafe key %s", (key) => {
+      const params = new URLSearchParams([[key, '{"polluted":"yes"}']]);
+      expect(() => generateFormData(params)).toThrow(/Unsafe form data key/);
+      // biome-ignore lint/suspicious/noExplicitAny: checking the global prototype
+      expect(({} as any).polluted).toBeUndefined();
+    });
+
+    it("rejects unsafe keys in a GET query string", async () => {
+      // global.Request is mocked by the parseFormData tests above
+      const request = {
+        url: "http://localhost/?constructor.prototype.polluted=yes",
+        method: "GET",
+      } as Request;
+      await expect(
+        getValidatedFormData(request, async (values) => ({
+          values,
+          errors: {},
+        })),
+      ).rejects.toThrow(/Unsafe form data key/);
+      // biome-ignore lint/suspicious/noExplicitAny: checking the global prototype
+      expect(({} as any).polluted).toBeUndefined();
+    });
+
+    it("does not walk into inherited properties", () => {
+      const params = new URLSearchParams(
+        "toString.call=1&valueOf[]=2&hasOwnProperty=a&hasOwnProperty=b",
+      );
+      expect(generateFormData(params)).toEqual({
+        toString: { call: 1 },
+        valueOf: [2],
+        hasOwnProperty: ["a", "b"],
+      });
+      expect(typeof Object.prototype.toString.call).toBe("function");
+    });
+  });
 });
 
 describe("isGet", () => {
