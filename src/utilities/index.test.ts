@@ -443,6 +443,20 @@ describe("createFormData", () => {
     expect(files[1]).toBeInstanceOf(Blob);
   });
 
+  it("parses an array with one file back as an array (#178)", () => {
+    const parsed = generateFormData(
+      createFormData({
+        files: [new File(["test"], "test.txt")],
+        // Already has the [] suffix, so it must not get a second one
+        "images[]": [new File(["test"], "image.png")],
+      }),
+    );
+    expect(parsed.files).toHaveLength(1);
+    expect(parsed.files[0]).toBeInstanceOf(File);
+    expect(parsed.images).toHaveLength(1);
+    expect(parsed.images[0]).toBeInstanceOf(File);
+  });
+
   it("accepts a file and adds it properly to formData", async () => {
     const formData = createFormData({
       file: new File(["test"], "test.txt"),

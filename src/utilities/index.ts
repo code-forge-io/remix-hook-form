@@ -201,6 +201,11 @@ export const validateFormData = async <
 
   return { errors: undefined, data: values as TTransformedValues };
 };
+
+// One entry parses back as a single value, so one file gets a "[]" key to parse back as an array
+const fileListKey = (key: string, length: number) =>
+  length === 1 && !key.endsWith("[]") ? `${key}[]` : key;
+
 /**
   Creates a new instance of FormData with the specified data and key.
   @template T - The type of the data parameter. It can be any type of FieldValues.
@@ -224,7 +229,7 @@ export const createFormData = <T extends FieldValues>(
     // Handle FileList
     if (typeof FileList !== "undefined" && value instanceof FileList) {
       for (let i = 0; i < value.length; i++) {
-        formData.append(key, value[i]);
+        formData.append(fileListKey(key, value.length), value[i]);
       }
       continue;
     }
@@ -235,7 +240,7 @@ export const createFormData = <T extends FieldValues>(
       value.every((item) => item instanceof File || item instanceof Blob)
     ) {
       for (let i = 0; i < value.length; i++) {
-        formData.append(key, value[i]);
+        formData.append(fileListKey(key, value.length), value[i]);
       }
       continue;
     }
